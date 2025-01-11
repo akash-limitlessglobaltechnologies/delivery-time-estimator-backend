@@ -38,6 +38,47 @@ const upload = multer({
   }
 });
 
+
+// HMAC validation middleware
+const validateShopifyHMAC = (req, res, next) => {
+  try {
+    const hmac = req.headers['x-shopify-hmac-sha256'];
+    const topic = req.headers['x-shopify-topic'];
+    const shop_domain = req.headers['x-shopify-shop-domain'];
+    
+    // If this is not a Shopify webhook request, proceed
+    if (!hmac && !topic && !shop_domain) {
+      return next();
+    }
+
+    // Get raw body data
+    const body = JSON.stringify(req.body);
+    
+    // Calculate HMAC
+    const calculated_hmac = crypto
+      .createHmac('sha256', SHOPIFY_CLIENT_SECRET)
+      .update(body, 'utf8')
+      .digest('base64');
+    
+    // Compare HMACs
+    if (calculated_hmac !== hmac) {
+      console.error('HMAC validation failed');
+      return res.status(401).json({ error: 'HMAC validation failed' });
+    }
+
+    next();
+  } catch (error) {
+    console.error('HMAC validation error:', error);
+    res.status(401).json({ error: 'Invalid HMAC' });
+  }
+};
+
+
+// Add HMAC validation to your app configuration after the existing middleware
+app.use(validateShopifyHMAC);
+
+
+
 // CORS configuration for Shopify
 app.use(cors({
   origin: (origin, callback) => {
@@ -73,7 +114,12 @@ app.use(session({
 }));
 
 app.use(cookieParser());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({
+  limit: '50mb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // MongoDB connection
@@ -326,7 +372,7 @@ app.post('/api/delivery-times/upload', verifyToken, upload.single('file'), async
 });
 
 // Get delivery times status
-app.get('/api/delivery-times/status', verifyToken, async (req, res) => {
+app.get('/api/delivery-times/status', validateShopifyHMAC, verifyToken, async (req, res) => {
   try {
     const config = await StoreDeliveryConfig.findOne({ shop: req.store.shop });
     res.json({
