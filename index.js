@@ -9,11 +9,13 @@ const crypto = require('crypto');
 const cookieParser = require('cookie-parser');
 const multer = require('multer');
 const XLSX = require('xlsx');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5005;
 
+const JWT_SECRET = process.env.JWT_SECRET || 'limitless';
 // Environment variables
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_API_KEY;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_API_SECRET;
@@ -81,25 +83,11 @@ app.use(validateShopifyHMAC);
 
 // CORS configuration for Shopify
 app.use(cors({
-  origin: (origin, callback) => {
-    const allowedOrigins = [
-      process.env.FRONTEND_URL,
-      /\.myshopify\.com$/,
-      'https://admin.shopify.com'
-    ];
-    
-    if (!origin || allowedOrigins.some(allowed => 
-      typeof allowed === 'string' ? allowed === origin : allowed.test(origin)
-    )) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Shop-Domain']
+  origin: [FRONTEND_URL, /\.myshopify\.com$/],
+  credentials: true
 }));
+
+app.use(cookieParser());
 
 // Session configuration
 app.use(session({
@@ -133,20 +121,20 @@ mongoose.connect(MONGODB_URI, {
 // Verify token middleware
 const verifyToken = async (req, res, next) => {
   try {
-    const token = req.headers.authorization?.split(' ')[1];
+    const token = req.headers.authorization?.split(' ')[1] || req.cookies.jwt;
     const shop = req.headers['x-shop-domain'];
     
     if (!token || !shop) {
       return res.status(401).json({ error: 'No token or shop domain provided' });
     }
 
+    // Verify JWT token
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // Find user and verify shop access
     const user = await ShopifyUser.findOne({
-      'stores': {
-        $elemMatch: {
-          'shop': shop,
-          'accessToken': token
-        }
-      }
+      _id: decoded.userId,
+      'stores.shop': shop
     });
 
     if (!user) {
@@ -158,6 +146,12 @@ const verifyToken = async (req, res, next) => {
     next();
   } catch (error) {
     console.error('Token verification error:', error);
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Token expired' });
+    }
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
     res.status(500).json({ error: 'Token verification failed' });
   }
 };
@@ -173,6 +167,7 @@ app.get('/auth/callback', async (req, res) => {
     const { shop, hmac, code, host } = req.query;
 
     if (code) {
+      // Exchange code for access token
       const accessTokenResponse = await axios.post(`https://${shop}/admin/oauth/access_token`, {
         client_id: SHOPIFY_CLIENT_ID,
         client_secret: SHOPIFY_CLIENT_SECRET,
@@ -181,6 +176,7 @@ app.get('/auth/callback', async (req, res) => {
 
       const accessToken = accessTokenResponse.data.access_token;
 
+      // Get shop data
       const shopResponse = await axios.get(`https://${shop}/admin/api/2024-01/shop.json`, {
         headers: {
           'X-Shopify-Access-Token': accessToken
@@ -188,11 +184,12 @@ app.get('/auth/callback', async (req, res) => {
       });
 
       const shopData = shopResponse.data.shop;
+      
+      // Find or create user
       let user = await ShopifyUser.findOne({ email: shopData.email });
 
       if (user) {
         const storeIndex = user.stores.findIndex(s => s.shop === shop);
-        
         if (storeIndex >= 0) {
           user.stores[storeIndex].accessToken = accessToken;
         } else {
@@ -216,11 +213,38 @@ app.get('/auth/callback', async (req, res) => {
       }
 
       await user.save();
-      req.session.shop = shop;
-      req.session.accessToken = accessToken;
 
-      res.redirect(`${FRONTEND_URL}?token=${accessToken}&shop=${shop}`);
+      // Generate JWT token
+      const jwtToken = jwt.sign(
+        { 
+          userId: user._id.toString(),
+          email: user.email,
+          shop: shop
+        },
+        JWT_SECRET,
+        { 
+          expiresIn: '4h',
+          algorithm: 'HS256'
+        }
+      );
+
+      // Set JWT in secure cookie
+      res.cookie('jwt', jwtToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 4 * 60 * 60 * 1000 // 4 hours
+      });
+
+      // Redirect to frontend with token and shop
+      const redirectUrl = new URL(FRONTEND_URL);
+      redirectUrl.searchParams.append('token', jwtToken);
+      redirectUrl.searchParams.append('shop', shop);
+
+      res.redirect(redirectUrl.toString());
+
     } else {
+      // Initial auth request
       if (!shop || !host) {
         return res.status(400).send('Missing required parameters');
       }
@@ -535,6 +559,11 @@ app.delete('/api/files/:fileId', verifyToken, async (req, res) => {
       details: error.message 
     });
   }
+});
+
+app.post('/api/logout', (req, res) => {
+  res.clearCookie('jwt');
+  res.json({ message: 'Logged out successfully' });
 });
 
 // Check status endpoint for theme app extension
