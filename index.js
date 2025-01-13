@@ -15,6 +15,47 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5005;
 
+const corsOptions = {
+  origin: function (origin, callback) {
+    const allowedOrigins = [
+      process.env.FRONTEND_URL,
+      'https://admin.shopify.com',
+      /\.myshopify\.com$/
+    ];
+
+    // Allow requests with no origin (like mobile apps, postman)
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    const isAllowed = allowedOrigins.some(allowedOrigin => 
+      typeof allowedOrigin === 'string' 
+        ? allowedOrigin === origin 
+        : allowedOrigin.test(origin)
+    );
+
+    if (isAllowed) {
+      callback(null, true);
+    } else {
+      console.log('Origin not allowed:', origin);
+      callback(new Error('CORS not allowed'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Shop-Domain',
+    'X-Shopify-Access-Token',
+    'X-Shopify-Hmac-Sha256',
+    'X-Shopify-Shop-Domain',
+    'X-Shopify-Topic'
+  ]
+};
+
+app.use(cors(corsOptions));
+
 const JWT_SECRET = process.env.JWT_SECRET || 'limitless';
 // Environment variables
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_API_KEY;
@@ -86,7 +127,7 @@ app.use(cors({
   origin: [FRONTEND_URL, /\.myshopify\.com$/],
   credentials: true
 }));
-
+app.options('*', cors(corsOptions));
 app.use(cookieParser());
 
 // Session configuration
